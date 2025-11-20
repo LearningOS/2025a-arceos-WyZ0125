@@ -8,6 +8,7 @@ use axtask::current;
 use axtask::TaskExtRef;
 use axhal::paging::MappingFlags;
 use arceos_posix_api as api;
+use axhal::mem::MemoryAddr;
 
 const SYS_IOCTL: usize = 29;
 const SYS_OPENAT: usize = 56;
@@ -132,6 +133,7 @@ fn handle_syscall(tf: &TrapFrame, syscall_num: usize) -> isize {
 }
 
 #[allow(unused_variables)]
+#[allow(unused_variables)]
 fn sys_mmap(
     addr: *mut usize,
     length: usize,
@@ -140,7 +142,86 @@ fn sys_mmap(
     fd: i32,
     _offset: isize,
 ) -> isize {
-    unimplemented!("no sys_mmap!");
+    use core::ffi::c_void;
+    use axhal::mem::VirtAddr;
+    use axhal::paging::MappingFlags;
+    use axerrno::LinuxError;
+    use axtask::current;
+    use axmm::AddrSpace;
+    use alloc::sync::Arc;
+    use axsync::Mutex;
+
+    // quick validations
+    if length == 0 {
+        return -LinuxError::EINVAL.code() as isize;
+    }
+
+    // convert prot -> MappingFlags (we already have `From<MmapProt> for MappingFlags`)
+    let prot_flags = match MmapProt::from_bits(prot) {
+        Some(p) => MappingFlags::from(p),
+        None => {
+            return -LinuxError::EINVAL.code() as isize;
+        }
+    };
+
+    // parse flags
+    let mmap_flags = MmapFlags::from_bits(flags).unwrap_or_else(|| MmapFlags::empty());
+    let is_anonymous = mmap_flags.contains(MmapFlags::MAP_ANONYMOUS);
+    let is_fixed = mmap_flags.contains(MmapFlags::MAP_FIXED);
+
+    // page-align length up to 4K
+    let page_size = axhal::mem::PAGE_SIZE_4K;
+    let len_aligned = ((length + page_size - 1) / page_size) * page_size;
+
+    // get current task and its aspace
+    let curr = current();
+    let aspace_arc: Arc<Mutex<AddrSpace>> = curr.task_ext().aspace.clone();
+    let mut aspace = aspace_arc.lock();
+
+    // decide mapping address
+    let base_vaddr = if addr.is_null() || (!is_fixed && (addr as usize) == 0) {
+        // choose a spot near aspace.end() (grow upward: allocate just below end)
+        let end = aspace.end();
+        // align down
+        let candidate = end.checked_sub(len_aligned).unwrap_or(0.into());
+        VirtAddr::from_usize(candidate.into()).align_down_4k()
+    } else {
+        // use requested addr (align down)
+        VirtAddr::from_usize(addr as usize).align_down_4k()
+    };
+
+    // perform mapping: map_alloc(vstart, size, flags, populating)
+    // choose "populating" = true so physical pages are allocated and zeroed (for anonymous)
+    let map_res = aspace.map_alloc(base_vaddr, len_aligned, prot_flags, true);
+    if map_res.is_err() {
+        return -LinuxError::ENOMEM.code() as isize;
+    }
+
+    // If mapping a file (not anonymous) -> fill pages by reading fd into that buffer.
+    if !is_anonymous && fd >= 0 {
+        // We'll read repeatedly until length bytes read or EOF.
+        // Use api::sys_read(fd, ptr, chunk_len) which expects user-space buffer pointer.
+        let mut off = 0usize;
+        while off < len_aligned {
+            let to_read = core::cmp::min(len_aligned - off, 4096);
+            let user_ptr = (base_vaddr.as_usize() + off) as *mut c_void;
+            // call api::sys_read -> returns isize: >=0 bytes read, negative errno
+            let r = api::sys_read(fd, user_ptr, to_read);
+            if r < 0 {
+                // read error -> unmap the region and return error
+                // TODO: if AddrSpace provides a remove/unmap API, call it; else leave mapping.
+                return r;
+            }
+            let nr = r as usize;
+            if nr == 0 {
+                break; // EOF
+            }
+            off += nr;
+        }
+    }
+
+    // success: return mapped address
+    base_vaddr.as_usize() as isize
 }
 
 fn sys_openat(dfd: c_int, fname: *const c_char, flags: c_int, mode: api::ctypes::mode_t) -> isize {

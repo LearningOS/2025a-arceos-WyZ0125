@@ -8,8 +8,10 @@ use axtask::current;
 use axtask::TaskExtRef;
 use axhal::paging::MappingFlags;
 use arceos_posix_api as api;
-use axhal::mem::MemoryAddr;
+use axhal::mem::{MemoryAddr};
+use memory_addr::VirtAddrRange;
 
+// 系统调用号定义
 const SYS_IOCTL: usize = 29;
 const SYS_OPENAT: usize = 56;
 const SYS_CLOSE: usize = 57;
@@ -20,13 +22,17 @@ const SYS_EXIT: usize = 93;
 const SYS_EXIT_GROUP: usize = 94;
 const SYS_SET_TID_ADDRESS: usize = 96;
 const SYS_MMAP: usize = 222;
+const SYS_GETUID: usize = 174;
+const SYS_GETGID: usize = 175;
+const SYS_GETEUID: usize = 176;
+const SYS_GETEGID: usize = 177;
+const SYS_PRCTL: usize = 157;
+const SYS_FSTAT: usize = 80;
+const SYS_ARCH_PRCTL: usize = 214;
 
 const AT_FDCWD: i32 = -100;
 
 /// Macro to generate syscall body
-///
-/// It will receive a function which return Result<_, LinuxError> and convert it to
-/// the type which is specified by the caller.
 #[macro_export]
 macro_rules! syscall_body {
     ($fn: ident, $($stmt: tt)*) => {{
@@ -48,14 +54,9 @@ macro_rules! syscall_body {
 bitflags::bitflags! {
     #[derive(Debug)]
     /// permissions for sys_mmap
-    ///
-    /// See <https://github.com/bminor/glibc/blob/master/bits/mman.h>
     struct MmapProt: i32 {
-        /// Page can be read.
         const PROT_READ = 1 << 0;
-        /// Page can be written.
         const PROT_WRITE = 1 << 1;
-        /// Page can be executed.
         const PROT_EXEC = 1 << 2;
     }
 }
@@ -79,20 +80,12 @@ impl From<MmapProt> for MappingFlags {
 bitflags::bitflags! {
     #[derive(Debug)]
     /// flags for sys_mmap
-    ///
-    /// See <https://github.com/bminor/glibc/blob/master/bits/mman.h>
     struct MmapFlags: i32 {
-        /// Share changes
         const MAP_SHARED = 1 << 0;
-        /// Changes private; copy pages on write.
         const MAP_PRIVATE = 1 << 1;
-        /// Map address must be exactly as requested, no matter whether it is available.
         const MAP_FIXED = 1 << 4;
-        /// Don't use a file.
         const MAP_ANONYMOUS = 1 << 5;
-        /// Don't check for reservations.
         const MAP_NORESERVE = 1 << 14;
-        /// Allocation is for a stack.
         const MAP_STACK = 0x20000;
     }
 }
@@ -124,15 +117,21 @@ fn handle_syscall(tf: &TrapFrame, syscall_num: usize) -> isize {
             tf.arg4() as _,
             tf.arg5() as _,
         ),
+        SYS_GETUID => sys_getuid(),
+        SYS_GETGID => sys_getgid(),
+        SYS_GETEUID => sys_geteuid(),
+        SYS_GETEGID => sys_getegid(),
+        SYS_PRCTL => sys_prctl(tf.arg0() as _, tf.arg1() as _, tf.arg2() as _, tf.arg3() as _, tf.arg4() as _),
+        SYS_FSTAT => sys_fstat(tf.arg0() as _, tf.arg1() as _),
+        SYS_ARCH_PRCTL => sys_arch_prctl(tf.arg0() as _, tf.arg1() as _),
         _ => {
             ax_println!("Unimplemented syscall: {}", syscall_num);
-            -LinuxError::ENOSYS.code() as _
+            -LinuxError::ENOSYS.code() as isize
         }
     };
     ret
 }
 
-#[allow(unused_variables)]
 #[allow(unused_variables)]
 fn sys_mmap(
     addr: *mut usize,
@@ -142,86 +141,118 @@ fn sys_mmap(
     fd: i32,
     _offset: isize,
 ) -> isize {
-    use core::ffi::c_void;
     use axhal::mem::VirtAddr;
     use axhal::paging::MappingFlags;
     use axerrno::LinuxError;
     use axtask::current;
     use axmm::AddrSpace;
-    use alloc::sync::Arc;
-    use axsync::Mutex;
 
     // quick validations
     if length == 0 {
         return -LinuxError::EINVAL.code() as isize;
     }
 
-    // convert prot -> MappingFlags (we already have `From<MmapProt> for MappingFlags`)
-    let prot_flags = match MmapProt::from_bits(prot) {
-        Some(p) => MappingFlags::from(p),
-        None => {
-            return -LinuxError::EINVAL.code() as isize;
-        }
-    };
-
-    // parse flags
+    // 解析标志
     let mmap_flags = MmapFlags::from_bits(flags).unwrap_or_else(|| MmapFlags::empty());
     let is_anonymous = mmap_flags.contains(MmapFlags::MAP_ANONYMOUS);
     let is_fixed = mmap_flags.contains(MmapFlags::MAP_FIXED);
+    
+    // 只支持匿名映射
+    if !is_anonymous {
+        return -LinuxError::ENOSYS.code() as isize;
+    }
+    
+    // 不支持文件映射
+    if fd >= 0 {
+        return -LinuxError::EBADF.code() as isize;
+    }
 
-    // page-align length up to 4K
-    let page_size = axhal::mem::PAGE_SIZE_4K;
-    let len_aligned = ((length + page_size - 1) / page_size) * page_size;
-
-    // get current task and its aspace
-    let curr = current();
-    let aspace_arc: Arc<Mutex<AddrSpace>> = curr.task_ext().aspace.clone();
-    let mut aspace = aspace_arc.lock();
-
-    // decide mapping address
-    let base_vaddr = if addr.is_null() || (!is_fixed && (addr as usize) == 0) {
-        // choose a spot near aspace.end() (grow upward: allocate just below end)
-        let end = aspace.end();
-        // align down
-        let candidate = end.checked_sub(len_aligned).unwrap_or(0.into());
-        VirtAddr::from_usize(candidate.into()).align_down_4k()
-    } else {
-        // use requested addr (align down)
-        VirtAddr::from_usize(addr as usize).align_down_4k()
+    // 转换保护标志
+    let prot_flags = match MmapProt::from_bits(prot) {
+        Some(p) => MappingFlags::from(p),
+        None => return -LinuxError::EINVAL.code() as isize,
     };
 
-    // perform mapping: map_alloc(vstart, size, flags, populating)
-    // choose "populating" = true so physical pages are allocated and zeroed (for anonymous)
+    // 页面对齐
+    let page_size = axhal::mem::PAGE_SIZE_4K;
+    let len_aligned = ((length + page_size - 1) / page_size) * page_size;
+    
+    // 获取地址空间
+    let curr = current();
+    let mut aspace = curr.task_ext().aspace.lock();
+
+    // 关键修复：尊重用户指定的地址
+    let base_vaddr = if !addr.is_null() && (addr as usize) != 0 {
+        // 用户指定了地址，直接使用（按页对齐）
+        VirtAddr::from_usize(addr as usize).align_down_4k()
+    } else if is_fixed {
+        // MAP_FIXED 但地址为NULL，返回错误
+        return -LinuxError::EINVAL.code() as isize;
+    } else {
+        // 自动分配地址 - 从低地址开始
+        let hint = VirtAddr::from(0x200000); // 2MB 位置
+        let limit = VirtAddrRange::from_start_size(hint, 0x10000000); // 256MB 范围
+        
+        match aspace.find_free_area(hint, len_aligned, limit) {
+            Some(addr) => addr,
+            None => return -LinuxError::ENOMEM.code() as isize,
+        }
+    };
+
+    // 检查地址范围
+    if !aspace.contains_range(base_vaddr, len_aligned) {
+        return -LinuxError::EINVAL.code() as isize;
+    }
+
+    // 执行映射
     let map_res = aspace.map_alloc(base_vaddr, len_aligned, prot_flags, true);
     if map_res.is_err() {
         return -LinuxError::ENOMEM.code() as isize;
     }
 
-    // If mapping a file (not anonymous) -> fill pages by reading fd into that buffer.
-    if !is_anonymous && fd >= 0 {
-        // We'll read repeatedly until length bytes read or EOF.
-        // Use api::sys_read(fd, ptr, chunk_len) which expects user-space buffer pointer.
-        let mut off = 0usize;
-        while off < len_aligned {
-            let to_read = core::cmp::min(len_aligned - off, 4096);
-            let user_ptr = (base_vaddr.as_usize() + off) as *mut c_void;
-            // call api::sys_read -> returns isize: >=0 bytes read, negative errno
-            let r = api::sys_read(fd, user_ptr, to_read);
-            if r < 0 {
-                // read error -> unmap the region and return error
-                // TODO: if AddrSpace provides a remove/unmap API, call it; else leave mapping.
-                return r;
-            }
-            let nr = r as usize;
-            if nr == 0 {
-                break; // EOF
-            }
-            off += nr;
-        }
-    }
+    // 返回用户期望的地址（不是对齐后的地址）
+    let result_addr = if !addr.is_null() && (addr as usize) != 0 {
+        addr as usize
+    } else {
+        base_vaddr.as_usize()
+    };
 
-    // success: return mapped address
-    base_vaddr.as_usize() as isize
+    ax_println!("mmap: addr={:p} -> {:#x}, size={:#x}", 
+               addr, result_addr, len_aligned);
+    
+    result_addr as isize
+}
+
+// 系统调用实现
+fn sys_getuid() -> isize {
+    0
+}
+
+fn sys_getgid() -> isize {
+    0
+}
+
+fn sys_geteuid() -> isize {
+    0
+}
+
+fn sys_getegid() -> isize {
+    0
+}
+
+fn sys_prctl(_option: c_int, _arg2: usize, _arg3: usize, _arg4: usize, _arg5: usize) -> isize {
+    0
+}
+
+fn sys_arch_prctl(_code: c_int, _addr: *mut c_void) -> isize {
+    0
+}
+
+fn sys_fstat(_fd: c_int, _statbuf: *mut api::ctypes::stat) -> isize {
+    unsafe {
+        core::ptr::write_bytes(_statbuf, 0, 1);
+    }
+    0
 }
 
 fn sys_openat(dfd: c_int, fname: *const c_char, flags: c_int, mode: api::ctypes::mode_t) -> isize {
@@ -252,6 +283,5 @@ fn sys_set_tid_address(tid_ptd: *const i32) -> isize {
 }
 
 fn sys_ioctl(_fd: i32, _op: usize, _argp: *mut c_void) -> i32 {
-    ax_println!("Ignore SYS_IOCTL");
     0
 }

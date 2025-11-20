@@ -6,5 +6,7 @@ use axstd::println;
 
 #[cfg_attr(feature = "axstd", no_mangle)]
 fn main() {
-    println!("[WithColor]: Hello, Arceos!");
+    // 输出红色的 Hello, Arceos!
+    // 颜色代码：\x1b[31m   重置：\x1b[0m
+    println!("\x1b[31mHello, Arceos!\x1b[0m");
 }

@@ -10,3 +10,4 @@ fn main() {
     // 颜色代码：\x1b[31m   重置：\x1b[0m
     println!("\x1b[31mHello, Arceos!\x1b[0m");
 }
+

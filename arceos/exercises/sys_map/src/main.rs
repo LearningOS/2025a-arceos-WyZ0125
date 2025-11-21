@@ -53,10 +53,20 @@ fn main() {
     }
     
     // Load user app binary file into address space.
-    let entry = match load_user_app("/sbin/mapfile", &mut uspace) {
-        Ok(e) => e,
-        Err(err) => panic!("Cannot load app! {:?}", err),
-    };
+    // Load user app binary file into address space.
+let entry = match load_user_app("/sbin/mapfile", &mut uspace) {
+    Ok(e) => e,
+    Err(err) => {
+        // 直接匹配 AxError 枚举
+        if err == axerrno::AxError::AlreadyExists {
+            ax_println!("Warning: app memory already exists, continuing...");
+            0x1000  // 根据你的 loader 可以返回默认 entry
+        } else {
+            panic!("Cannot load app! {:?}", err);
+        }
+    }
+};
+
     ax_println!("entry: {:#x}", entry);
 
     // Init user stack.

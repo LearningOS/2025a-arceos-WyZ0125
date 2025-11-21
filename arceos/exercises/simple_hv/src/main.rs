@@ -144,3 +144,4 @@ fn prepare_guest_context(ctx: &mut VmCpuRegisters) {
     // Return to entry to start vm.
     ctx.guest_regs.sepc = VM_ENTRY;
 }
+

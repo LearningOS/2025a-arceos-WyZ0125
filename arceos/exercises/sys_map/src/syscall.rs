@@ -4,6 +4,7 @@ use core::ffi::{c_void, c_char, c_int};
 use axhal::arch::TrapFrame;
 use axhal::trap::{register_trap_handler, SYSCALL};
 use axerrno::LinuxError;
+use axerrno::AxError;
 use axtask::current;
 use axhal::paging::MappingFlags;
 use arceos_posix_api as api;
@@ -13,7 +14,7 @@ use memory_addr::MemoryAddr;
 use axmm::AddrSpace;
 use alloc::sync::Arc;
 use axsync::Mutex;
-
+use core::iter::Once;
 use axtask::TaskExtRef;
 
 // 系统调用号定义（完整且去重）
@@ -47,25 +48,21 @@ const SYS_RT_SIGPROCMASK: usize = 136;
 const SYS_SCHED_YIELD: usize = 124;
 
 const AT_FDCWD: i32 = -100;
-
-/// 在用户程序启动时预映射低地址空间
+///
 fn pre_map_low_memory() {
     let curr = current();
     let aspace_arc: Arc<Mutex<AddrSpace>> = curr.task_ext().aspace.clone();
     let mut aspace = aspace_arc.lock();
 
     let start = VirtAddr::from(0x0);
-    let size = 0x10000; // 64KB
+    let size = 0x10000;
     let flags = MappingFlags::USER | MappingFlags::READ | MappingFlags::WRITE | MappingFlags::EXECUTE;
 
-    // 尝试映射，如果冲突就忽略
+    // 兼容 AlreadyExists
     let _ = aspace.map_alloc(start, size, flags, true)
-        .or_else(|e| {
-            if e == axerrno::AxError::AlreadyExists {
-                Ok(()) // 忽略冲突
-            } else {
-                Err(e)
-            }
+        .or_else(|e| match e {
+            AxError::AlreadyExists => Ok(()), // 忽略冲突
+            _ => Err(e),
         });
 }
 
@@ -117,6 +114,7 @@ fn handle_syscall(tf: &TrapFrame, syscall_num: usize) -> isize {
             FIRST_CALL = false;
         }
     }
+   
     
     ax_println!("handle_syscall [{}] ...", syscall_num);
     let ret = match syscall_num {

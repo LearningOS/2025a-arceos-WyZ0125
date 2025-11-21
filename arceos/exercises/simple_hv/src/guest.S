@@ -29,6 +29,7 @@ _run_guest:
     sd   s11, ({hyp_s11})(a0)
     sd   sp, ({hyp_sp})(a0)
 
+
     /* Swap in guest CSRs. */
     ld    t1, ({guest_sstatus})(a0)
     csrrw t1, sstatus, t1

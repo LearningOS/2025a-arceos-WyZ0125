@@ -49,19 +49,26 @@ const SYS_SCHED_YIELD: usize = 124;
 const AT_FDCWD: i32 = -100;
 
 /// 在用户程序启动时预映射低地址空间
-/*fn pre_map_low_memory() {
+fn pre_map_low_memory() {
     let curr = current();
     let aspace_arc: Arc<Mutex<AddrSpace>> = curr.task_ext().aspace.clone();
     let mut aspace = aspace_arc.lock();
-    
-    // 映射0x0-0x10000（64KB）的低地址空间
+
     let start = VirtAddr::from(0x0);
     let size = 0x10000; // 64KB
     let flags = MappingFlags::USER | MappingFlags::READ | MappingFlags::WRITE | MappingFlags::EXECUTE;
-    
-    // 忽略已存在的错误
-    let _ = aspace.map_alloc(start, size, flags, true);
-}*/
+
+    // 尝试映射，如果冲突就忽略
+    let _ = aspace.map_alloc(start, size, flags, true)
+        .or_else(|e| {
+            if e == axerrno::AxError::AlreadyExists {
+                Ok(()) // 忽略冲突
+            } else {
+                Err(e)
+            }
+        });
+}
+
 
 bitflags::bitflags! {
     #[derive(Debug)]
@@ -103,13 +110,13 @@ bitflags::bitflags! {
 #[register_trap_handler(SYSCALL)]
 fn handle_syscall(tf: &TrapFrame, syscall_num: usize) -> isize {
     // 在第一个系统调用时预映射低地址
-    /*static mut FIRST_CALL: bool = true;
+    static mut FIRST_CALL: bool = true;
     unsafe {
         if FIRST_CALL {
             pre_map_low_memory();
             FIRST_CALL = false;
         }
-    }*/
+    }
     
     ax_println!("handle_syscall [{}] ...", syscall_num);
     let ret = match syscall_num {

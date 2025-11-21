@@ -94,6 +94,7 @@ axfs_ramfs = { path = "./axfs_ramfs" }
 
 [patch.crates-io]
 kernel_guard = { path = "../crates/kernel_guard"} 
+axerrno = { git = "https://github.com/arceos-org/axerrno.git", tag = "v0.1.0" }
 
 [profile.release]
 lto = true

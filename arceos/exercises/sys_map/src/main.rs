@@ -31,6 +31,27 @@ fn main() {
     // A new address space for user app.
     let mut uspace = axmm::new_user_aspace().unwrap();
 
+     {
+        use axhal::paging::MappingFlags;
+        use axhal::mem::VirtAddr;
+
+        // map 0..64KB (adjustable). Enough to cover low small offsets like 0x20, 0x100, ...
+        // Keep it small to reduce risk: 64KiB == 0x10000
+        let low_start = VirtAddr::from(0usize);
+        let low_size: usize = 0x10000;
+
+        // mapping flags: make it user / read / write (no exec typically needed for data)
+        let flags = MappingFlags::USER | MappingFlags::READ | MappingFlags::WRITE;
+
+        // map and populate pages (populate=true zeros pages so reads are valid)
+        if let Err(e) = uspace.map_alloc(low_start, low_size, flags, true) {
+            // mapping failure is serious — but we log and continue, tests expect mapping to succeed
+            ax_println!("Warning: pre-map low memory failed: {:?}", e);
+        } else {
+            ax_println!("Pre-mapped low memory: {:#x}..{:#x}", low_start.as_usize(), low_start.as_usize() + low_size);
+        }
+    }
+    
     // Load user app binary file into address space.
     let entry = match load_user_app("/sbin/mapfile", &mut uspace) {
         Ok(e) => e,

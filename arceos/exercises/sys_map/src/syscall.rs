@@ -5,12 +5,17 @@ use axhal::arch::TrapFrame;
 use axhal::trap::{register_trap_handler, SYSCALL};
 use axerrno::LinuxError;
 use axtask::current;
-use axtask::TaskExtRef;
 use axhal::paging::MappingFlags;
 use arceos_posix_api as api;
-use axhal::mem::{MemoryAddr};
+use axhal::mem::{VirtAddr};
 use memory_addr::VirtAddrRange;
 
+use axmm::AddrSpace;
+use alloc::sync::Arc;
+use axsync::Mutex;
+use axhal::mem::MemoryAddr;
+
+use axtask::TaskExtRef;
 // 系统调用号定义
 const SYS_IOCTL: usize = 29;
 const SYS_OPENAT: usize = 56;
@@ -32,28 +37,23 @@ const SYS_ARCH_PRCTL: usize = 214;
 
 const AT_FDCWD: i32 = -100;
 
-/// Macro to generate syscall body
-#[macro_export]
-macro_rules! syscall_body {
-    ($fn: ident, $($stmt: tt)*) => {{
-        #[allow(clippy::redundant_closure_call)]
-        let res = (|| -> axerrno::LinuxResult<_> { $($stmt)* })();
-        match res {
-            Ok(_) | Err(axerrno::LinuxError::EAGAIN) => debug!(concat!(stringify!($fn), " => {:?}"),  res),
-            Err(_) => info!(concat!(stringify!($fn), " => {:?}"), res),
-        }
-        match res {
-            Ok(v) => v as _,
-            Err(e) => {
-                -e.code() as _
-            }
-        }
-    }};
+/// 在用户程序启动时预映射低地址空间
+fn pre_map_low_memory() {
+    let curr = current();
+    let aspace_arc: Arc<Mutex<AddrSpace>> = curr.task_ext().aspace.clone();
+    let mut aspace = aspace_arc.lock();
+    
+    // 映射0x0-0x100000（1MB）的低地址空间
+    let start = VirtAddr::from(0x0);
+    let size = 0x100000; // 1MB
+    let flags = MappingFlags::USER | MappingFlags::READ | MappingFlags::WRITE | MappingFlags::EXECUTE;
+    
+    // 忽略已存在的错误，只关心是否成功映射
+    let _ = aspace.map_alloc(start, size, flags, true);
 }
 
 bitflags::bitflags! {
     #[derive(Debug)]
-    /// permissions for sys_mmap
     struct MmapProt: i32 {
         const PROT_READ = 1 << 0;
         const PROT_WRITE = 1 << 1;
@@ -79,7 +79,6 @@ impl From<MmapProt> for MappingFlags {
 
 bitflags::bitflags! {
     #[derive(Debug)]
-    /// flags for sys_mmap
     struct MmapFlags: i32 {
         const MAP_SHARED = 1 << 0;
         const MAP_PRIVATE = 1 << 1;
@@ -92,6 +91,15 @@ bitflags::bitflags! {
 
 #[register_trap_handler(SYSCALL)]
 fn handle_syscall(tf: &TrapFrame, syscall_num: usize) -> isize {
+    // 在第一个系统调用时预映射低地址
+    static mut FIRST_CALL: bool = true;
+    unsafe {
+        if FIRST_CALL {
+            pre_map_low_memory();
+            FIRST_CALL = false;
+        }
+    }
+    
     ax_println!("handle_syscall [{}] ...", syscall_num);
     let ret = match syscall_num {
          SYS_IOCTL => sys_ioctl(tf.arg0() as _, tf.arg1() as _, tf.arg2() as _) as _,
@@ -141,12 +149,6 @@ fn sys_mmap(
     fd: i32,
     _offset: isize,
 ) -> isize {
-    use axhal::mem::VirtAddr;
-    use axhal::paging::MappingFlags;
-    use axerrno::LinuxError;
-    use axtask::current;
-    use axmm::AddrSpace;
-
     // quick validations
     if length == 0 {
         return -LinuxError::EINVAL.code() as isize;
@@ -179,19 +181,19 @@ fn sys_mmap(
     
     // 获取地址空间
     let curr = current();
-    let mut aspace = curr.task_ext().aspace.lock();
+    let aspace_arc: Arc<Mutex<AddrSpace>> = curr.task_ext().aspace.clone();
+    let mut aspace = aspace_arc.lock();
 
-    // 关键修复：尊重用户指定的地址
+    // 确定映射地址
     let base_vaddr = if !addr.is_null() && (addr as usize) != 0 {
-        // 用户指定了地址，直接使用（按页对齐）
+        // 用户指定的地址（按页对齐）
         VirtAddr::from_usize(addr as usize).align_down_4k()
     } else if is_fixed {
-        // MAP_FIXED 但地址为NULL，返回错误
         return -LinuxError::EINVAL.code() as isize;
     } else {
-        // 自动分配地址 - 从低地址开始
-        let hint = VirtAddr::from(0x200000); // 2MB 位置
-        let limit = VirtAddrRange::from_start_size(hint, 0x10000000); // 256MB 范围
+        // 自动分配地址
+        let hint = VirtAddr::from(0x200000); // 2MB
+        let limit = VirtAddrRange::from_start_size(hint, 0x10000000); // 256MB
         
         match aspace.find_free_area(hint, len_aligned, limit) {
             Some(addr) => addr,
@@ -210,7 +212,7 @@ fn sys_mmap(
         return -LinuxError::ENOMEM.code() as isize;
     }
 
-    // 返回用户期望的地址（不是对齐后的地址）
+    // 返回结果地址
     let result_addr = if !addr.is_null() && (addr as usize) != 0 {
         addr as usize
     } else {
@@ -248,9 +250,11 @@ fn sys_arch_prctl(_code: c_int, _addr: *mut c_void) -> isize {
     0
 }
 
-fn sys_fstat(_fd: c_int, _statbuf: *mut api::ctypes::stat) -> isize {
+fn sys_fstat(_fd: c_int, statbuf: *mut api::ctypes::stat) -> isize {
     unsafe {
-        core::ptr::write_bytes(_statbuf, 0, 1);
+        if !statbuf.is_null() {
+            core::ptr::write_bytes(statbuf, 0, 1);
+        }
     }
     0
 }

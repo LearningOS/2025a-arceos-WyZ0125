@@ -59,15 +59,36 @@ fn main() {
 let entry = match load_user_app("/sbin/mapfile", &mut uspace) {
     Ok(e) => e,
     Err(err) => {
-        // 直接匹配 AxError 枚举
+        // 如果是 AlreadyExists，尝试在现有地址空间中找 ELF header 并解析 e_entry
         if err == axerrno::AxError::AlreadyExists {
-            ax_println!("Warning: app memory already exists, continuing...");
-            0x1000  // 根据你的 loader 可以返回默认 entry
+            ax_println!("Warning: app memory already exists, trying to detect entry from memory...");
+            // 扫描低地址空间 —— 这里扫描 0x0..0x10000（64KiB），按需扩大
+            let scan_start = 0x0usize;
+            let scan_end = 0x10000usize;
+            if let Some(found_entry) = find_elf_entry_in_uspace(&mut uspace, scan_start, scan_end) {
+                ax_println!("Detected ELF entry at {:#x}, continuing...", found_entry);
+                found_entry
+            } else {
+                // 如果没找到，再尝试更保守的行为：打印更多调试信息并 panic（或按你项目策略处理）
+                ax_println!("Failed to detect ELF entry in memory (AlreadyExists). Dumping diagnostics...");
+                // 尝试打印低地址几个页的前 16 字节，帮助定位
+                let mut d = [0u8; 16];
+                for probe in (0usize..0x2000).step_by(0x1000) {
+                    let va = axhal::mem::VirtAddr::from_usize(probe);
+                    if uspace.read(va, &mut d).is_ok() {
+                        ax_println!("mem@{:#x}: {:02x?}", probe, &d);
+                    } else {
+                        ax_println!("mem@{:#x}: read err", probe);
+                    }
+                }
+                panic!("Cannot load app and cannot detect existing ELF entry: {:?}", err);
+            }
         } else {
             panic!("Cannot load app! {:?}", err);
         }
     }
 };
+
 
     ax_println!("entry: {:#x}", entry);
 
@@ -85,6 +106,31 @@ let entry = match load_user_app("/sbin/mapfile", &mut uspace) {
     let exit_code = user_task.join();
     ax_println!("monolithic kernel exit [{:?}] normally!", exit_code);
 }
+
+// helper: 在用户地址空间里扫描 ELF magic 并返回 e_entry（如果找到）
+fn find_elf_entry_in_uspace(uspace: &mut AddrSpace, scan_start: usize, scan_end: usize) -> Option<usize> {
+    use axhal::mem::VirtAddr;
+    use core::convert::TryInto;
+
+    let page_sz = axhal::mem::PAGE_SIZE_4K as usize;
+    let mut buf = [0u8; 64]; // 足够读取 ELF header 的前 64 字节
+    let mut addr = scan_start;
+
+    while addr < scan_end {
+        let va = VirtAddr::from_usize(addr);
+        if uspace.read(va, &mut buf).is_ok() {
+            if buf[0] == 0x7f && buf[1] == b'E' && buf[2] == b'L' && buf[3] == b'F' {
+                // ELF64 little-endian: e_entry 在 offset 24, 长度 8
+                let entry_bytes: [u8; 8] = buf[24..32].try_into().unwrap();
+                let entry = u64::from_le_bytes(entry_bytes) as usize;
+                return Some(entry);
+            }
+        }
+        addr += page_sz;
+    }
+    None
+}
+
 
 fn init_user_stack(uspace: &mut AddrSpace, populating: bool) -> io::Result<VirtAddr> {
     let ustack_top = uspace.end();

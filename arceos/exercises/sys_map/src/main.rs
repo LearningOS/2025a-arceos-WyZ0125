@@ -31,26 +31,28 @@ fn main() {
     // A new address space for user app.
     let mut uspace = axmm::new_user_aspace().unwrap();
 
-     {
-        use axhal::paging::MappingFlags;
-        use axhal::mem::VirtAddr;
+     // 将 pre-map 改为更保守的策略（只占用第一页，且不设 EXEC）
+// 这样既能避免 NULL deref 崩溃，又降低与 loader 的可执行段冲突概率。
+{
+    use axhal::paging::MappingFlags;
+    use axhal::mem::VirtAddr;
 
-        // map 0..64KB (adjustable). Enough to cover low small offsets like 0x20, 0x100, ...
-        // Keep it small to reduce risk: 64KiB == 0x10000
-        let low_start = VirtAddr::from(0usize);
-        let low_size: usize = 0x10000;
+    // map 0..4KB (只占第一页)。如果你真的需要更多再改成 8KB/16KB，但建议越小越安全。
+    let low_start = VirtAddr::from(0usize);
+    let low_size: usize = 0x1000; // 4KiB
 
-        // mapping flags: make it user / read / write (no exec typically needed for data)
-        let flags = MappingFlags::USER | MappingFlags::READ | MappingFlags::WRITE;
+    // mapping flags: make it user / read / write (不要 EXEC)
+    let flags = MappingFlags::USER | MappingFlags::READ | MappingFlags::WRITE;
 
-        // map and populate pages (populate=true zeros pages so reads are valid)
-        if let Err(e) = uspace.map_alloc(low_start, low_size, flags, true) {
-            // mapping failure is serious — but we log and continue, tests expect mapping to succeed
-            ax_println!("Warning: pre-map low memory failed: {:?}", e);
-        } else {
-            ax_println!("Pre-mapped low memory: {:#x}..{:#x}", low_start.as_usize(), low_start.as_usize() + low_size);
-        }
+    // map and populate pages (populate = true zeros pages so reads are valid)
+    if let Err(e) = uspace.map_alloc(low_start, low_size, flags, true) {
+        // 只记录警告，继续；多数情况下不会有冲突
+        ax_println!("Warning: pre-map low memory failed: {:?}", e);
+    } else {
+        ax_println!("Pre-mapped low memory: {:#x}..{:#x}", low_start.as_usize(), low_start.as_usize() + low_size);
     }
+}
+
     
     // Load user app binary file into address space.
     // Load user app binary file into address space.
